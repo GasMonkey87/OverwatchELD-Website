@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>OverWatch ELD Live Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; background: #08152f; color: white; font-family: Arial, sans-serif; }
+    #map { position: absolute; inset: 0; }
+    .hud {
+      position: absolute; top: 12px; left: 12px; z-index: 10;
+      background: rgba(8, 21, 47, 0.94); border: 1px solid rgba(96,165,250,.35);
+      border-radius: 12px; padding: 12px 14px; min-width: 320px; max-width: 520px;
+      box-shadow: 0 16px 35px rgba(0,0,0,.25);
+    }
+    .hud h2 { margin: 0 0 8px 0; font-size: 18px; }
+    .muted { opacity: 0.85; font-size: 13px; line-height: 1.45; }
+    .pill { display: inline-block; margin-top: 7px; padding: 4px 8px; border: 1px solid rgba(125,211,252,.55); color:#bfdbfe; border-radius: 999px; font-size: 12px; }
+    .warn { color:#fde68a; }
+    .error { color:#fecaca; }
+    .driver-marker {
+      width: 18px; height: 18px; border-radius: 50%; background: #38bdf8;
+      border: 3px solid #e0f2fe; box-shadow: 0 0 0 5px rgba(56,189,248,.25), 0 0 22px rgba(56,189,248,.9);
+    }
+    .driver-marker.stale { background:#f59e0b; border-color:#fff7ed; box-shadow:0 0 0 5px rgba(245,158,11,.22); }
+    .maplibregl-popup-content { background:#020617; color:#f8fafc; border:1px solid #334155; border-radius:12px; }
+    .maplibregl-popup-tip { border-top-color:#020617!important; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="hud">
+    <h2>OverWatch Live Map</h2>
+    <div id="mapStatus" class="muted">Loading…</div>
+    <div id="tileStatus" class="pill">Tiles: checking…</div>
+    <div id="debugStatus" class="muted" style="margin-top:8px"></div>
+  </div>
+
+  <script>
+    function qs(name) { return new URLSearchParams(window.location.search).get(name) || ""; }
+    const guildId = qs("guildId");
+    const statusEl = document.getElementById("mapStatus");
+    const tileEl = document.getElementById("tileStatus");
+    const debugEl = document.getElementById("debugStatus");
+
+    let markers = [];
+    let map;
+    let fitOnce = false;
+
+    function esc(v){
+      return String(v ?? "").replace(/[&<>\"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[s]));
+    }
+
+    async function safeJsonResponse(res){
+      const text = await res.text();
+      if(!text || !text.trim()){
+        return { ok:false, source:"empty", points:[], drivers:[], error:`Empty response HTTP ${res.status}` };
+      }
+
+      try{
+        return JSON.parse(text);
+      }catch(e){
+        return { ok:false, source:"bad-json", points:[], drivers:[], error:`Bad JSON HTTP ${res.status}: ${text.slice(0,180)}` };
+      }
+    }
+
+    async function getTileSource(){
+      try{
+        const res = await fetch('/api/map/tiles/status', { cache:'no-store' });
+        const data = await safeJsonResponse(res);
+        if(data && data.hasTiles){
+          tileEl.textContent = 'Tiles: uploaded /map-tiles';
+          tileEl.classList.remove('warn');
+          return {
+            id: 'uploaded-tiles',
+            source: {
+              type: 'raster',
+              tiles: [`${location.origin}/map-tiles/{z}/{x}/{y}.png`],
+              tileSize: 256,
+              attribution: 'OverWatch ELD uploaded map tiles'
+            }
+          };
+        }
+      }catch(e){ }
+
+      tileEl.textContent = 'Tiles: fallback OpenStreetMap';
+      tileEl.classList.add('warn');
+      return {
+        id: 'osm',
+        source: {
+          type: 'raster',
+          tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+          tileSize: 256,
+          attribution: '© OpenStreetMap contributors'
+        }
+      };
+    }
+
+    async function bootMap(){
+      const tile = await getTileSource();
+      map = new maplibregl.Map({
+        container: 'map',
+        style: {
+          version: 8,
+          sources: { [tile.id]: tile.source },
+          layers: [{ id: tile.id, type: 'raster', source: tile.id }]
+        },
+        center: [-98.5795, 39.8283],
+        zoom: 3
+      });
+
+      map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+      map.on('load', async () => {
+        await loadMapData();
+        setInterval(loadMapData, 5000);
+      });
+    }
+
+    function clearMarkers(){
+      for(const m of markers) m.remove();
+      markers = [];
+    }
+
+    function ageText(lastSeenUtc){
+      const d = new Date(lastSeenUtc);
+      if(isNaN(d.getTime())) return '';
+      const sec = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+      if(sec < 60) return `${sec}s ago`;
+      return `${Math.round(sec / 60)}m ago`;
+    }
+
+    async function loadMapData(){
+      try{
+        const url = guildId ? `/api/map/live?guildId=${encodeURIComponent(guildId)}` : '/api/map/live';
+        const res = await fetch(url, { cache:'no-store' });
+        const data = await safeJsonResponse(res);
+
+        if(data.ok === false && data.source !== 'none'){
+          statusEl.innerHTML = `<span class="error">Map polling error: ${esc(data.error || 'Unknown API error')}</span>`;
+          debugEl.innerHTML = `Source: ${esc(data.source || 'error')} · HTTP ${esc(res.status)}`;
+          return;
+        }
+
+        const points = Array.isArray(data.points)
+          ? data.points
+          : (Array.isArray(data.drivers) ? data.drivers : []);
+
+        clearMarkers();
+
+        statusEl.textContent = `${points.length} drivers on map · Guild ${data.guildId || guildId || '-'}`;
+        debugEl.innerHTML = `Source: ${esc(data.source || 'none')} · Telemetry rows: ${esc(data.telemetryRows ?? data.telemetryCount ?? 0)} · Status rows: ${esc(data.statusRows ?? data.statusCount ?? 0)}`;
+
+        const bounds = new maplibregl.LngLatBounds();
+        let validCount = 0;
+
+        for(const p of points){
+          const lat = Number(p.latitude ?? p.lat);
+          const lng = Number(p.longitude ?? p.lng ?? p.lon);
+          if(!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
+
+          const age = ageText(p.lastSeenUtc || p.updatedUtc);
+          const stale = age.includes('m ago') && parseInt(age) >= 10;
+          const el = document.createElement('div');
+          el.className = 'driver-marker' + (stale ? ' stale' : '');
+
+          const popup = new maplibregl.Popup({ offset: 18 }).setHTML(`
+            <strong>${esc(p.driverName || p.driver || 'Driver')}</strong><br>
+            Status: ${esc(p.dutyStatus || p.status || '-')}<br>
+            Truck: ${esc(p.truck || p.truckName || p.truckNumber || '-')}<br>
+            Load: ${esc(p.loadNumber || '-')}<br>
+            Cargo: ${esc(p.cargoName || p.cargo || '-')}<br>
+            Speed: ${Math.round(Number(p.speedMph ?? p.speed ?? 0))} mph<br>
+            Location: ${esc(p.location || '-')}<br>
+            Converted: ${Number(lat).toFixed(5)}, ${Number(lng).toFixed(5)}<br>
+            Source: ${esc(p.source || data.source || '-')}<br>
+            Seen: ${esc(age || '-')}
+          `);
+
+          const marker = new maplibregl.Marker({ element: el })
+            .setLngLat([lng, lat])
+            .setPopup(popup)
+            .addTo(map);
+
+          markers.push(marker);
+          bounds.extend([lng, lat]);
+          validCount++;
+        }
+
+        if(validCount > 0 && !fitOnce){
+          map.fitBounds(bounds, { padding: 80, maxZoom: 7, duration: 800 });
+          fitOnce = true;
+        }
+      }catch(e){
+        statusEl.innerHTML = `<span class="error">Map polling error: ${esc(e.message)}</span>`;
+        debugEl.textContent = '';
+      }
+    }
+
+    bootMap();
+  </script>
+</body>
+</html>
